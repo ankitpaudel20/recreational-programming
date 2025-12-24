@@ -2,13 +2,13 @@ package main
 
 import (
 	"bufio"
-	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 )
 
 func panic_error(err error) {
@@ -34,7 +34,6 @@ func assertIfError(err error, format_string string, args ...any) {
 	}
 }
 
-
 func encode_command(cmd string) []byte {
 	words := strings.Fields(cmd)
 	CLRF := "\r\n"
@@ -52,132 +51,158 @@ func encode_command(cmd string) []byte {
 	return buf
 }
 
-func decode_response(resp []byte) string {
-	getlen := func(temp []byte) (int, error) {
-		first_delim := bytes.Index(temp, []byte{'\r', '\n'})
-		return strconv.Atoi(string(temp[1:first_delim]))
-	}
+var CLRF = []byte{'\r', '\n'}
 
-	if len(resp) == 0 {
-		return ""
-	}
+func __discard_last_delimiter_redis(res *bufio.Reader) {
+	_, err := res.Discard(len(CLRF))
+	assertIfError(err, "Error in parsing RESP: could not find the end of the command| %e")
 
-	switch resp[0] {
+}
+
+func __get_initial_len_redis(res *bufio.Reader) int {
+	data, err := res.ReadBytes('\r')
+	res.Discard(1)
+	assertIfError(err, "Error in parsing RESP: did not find the data delimiter | %e")
+	string_len, err := strconv.Atoi(string(data[:len(data)-1]))
+	assertIfError(err, "Error in parsing RESP: error reading length of next data| %e")
+	return string_len
+}
+
+func decode_response(resp *bufio.Reader) string {
+
+	first_byte, err := resp.ReadByte()
+	assertIfError(err, "Error in parsing RESP: no byte received from server | %e")
+
+	switch first_byte {
+	case '_':
+		return "NULL"
+	case '#':
+		next_byte, err := resp.ReadByte()
+		assertIfError(err, "Error in parsing RESP: can't read bool | %e")
+		if next_byte == 't' {
+			return "true"
+		}
+		return "false"
+	case '$':
+		string_len := __get_initial_len_redis(resp)
+		if string_len == -1 {
+			return "NIL"
+		}
+		data := make([]byte, string_len)
+		_, err := io.ReadFull(resp, data)
+
+		assertIfError(err, "Error in parsing RESP: could not find the end of the command| %e")
+		__discard_last_delimiter_redis(resp)
+		return string(data)
+	case '*':
+		array_len := __get_initial_len_redis(resp)
+		if array_len < 0 {
+			return "[NIL]"
+		}
+		if array_len == 1 {
+			return "[]"
+		}
+		ret := "["
+		for i := 0; i < array_len; i++ {
+			decoded_data := decode_response(resp)
+			ret = ret + decoded_data + ","
+		}
+		ret += "]"
+		__discard_last_delimiter_redis(resp)
+		return ret
+	case '%':
+		map_len := __get_initial_len_redis(resp)
+		res := ""
+		for _ = range map_len {
+			res += (decode_response(resp) + "==>" + decode_response(resp))
+		}
+		__discard_last_delimiter_redis(resp)
+		return res
+	case ':':
+		number := __get_initial_len_redis(resp)
+		return strconv.Itoa(number)
 	case '-':
 		fallthrough
 	case '+':
-		fallthrough
-	case ':':
-		return string(resp[1 : len(resp)-2])
-	case '$':
-		if resp[1] == '-' {
-			return ""
-		}
-		data := bytes.SplitN(resp, []byte{'\r', '\n'}, 2)
-		return string(data[1])
-	case '*':
-		n, err := getlen(resp)
-		first_delim := bytes.Index(resp, []byte{'\r', '\n'})
-		assertIfError(err, "error while parsing array in redis response | %e")
-		ret := "["
-		for i := 0; i < n; i++ {
-			ret = ret + decode_response(resp[first_delim+2:]) + ","
-		}
-		ret += "]"
-		return ret
+		data, err := resp.ReadBytes('\r')
+		resp.Discard(1)
+		assertIfError(err, "Error in parsing RESP: could not find the end of the command| %e")
+		return string(data)
 	}
 	assert(false, "code should not reach here, pls check the decode function")
 	return ""
 }
 
+type RedisData struct {
+	command   []byte
+	recv_chan chan *bufio.Reader
+}
+
 type Redis struct {
-	conn   net.Conn
-	reader *bufio.Reader
-	writer *bufio.Writer
+	// conn         net.Conn
+	conn_pool *ResourcePool[*bufio.ReadWriter]
 }
 
-
-func authenticate(redis Redis, username string, password string) {
-	recv_data := redis.RunCommand( fmt.Sprintf("auth %s %s", username, password))
-	decoded_resp := decode_response([]byte(recv_data))
-	assert(decoded_resp == "OK", "error authenticating: '%s'", recv_data)
+func (redis *Redis) RunCommandNew(command string) (string, error) {
+	read_writer := redis.conn_pool.Get()
+	defer redis.conn_pool.Release(read_writer)
+	read_writer.Write(encode_command(command))
+	err := read_writer.Flush()
+	if err != nil {
+		return "", err
+	}
+	response := decode_response(read_writer.Reader)
+	return response, nil
 }
 
-func (redis * Redis)RunCommand(command string) []byte {
-	encoded_command := encode_command(command)
-	redis.conn.Write(encoded_command)
-	recv_buffer := make([]byte, 1024)
-	n, err := redis.conn.Read(recv_buffer)
-	assertIfError(err, "error running command %s: '%e'", command)
-	assert(n != 0, "error running command %s | could not read from socket", command)
-	return recv_buffer[:n]
-}
-
-func RedisFromURI(uri string) Redis {
+func RedisFromURI(uri string) *Redis {
 	u, err := url.Parse(uri)
 	assertIfError(err, "invalid redis uri | '%e'")
 	assert(u.Scheme == "redis", "invalid uri scheme, must be set to 'redis'")
-	conn, err := net.Dial("tcp", u.Host)
+	initializer_func := func() (*bufio.ReadWriter, error) {
+		conn, err := net.Dial("tcp", u.Host)
+		assertIfError(err, "can't connect to redis, error: '%e'")
+		pass, has_pass := u.User.Password()
+		if has_pass {
+			cmd := encode_command(fmt.Sprintf("auth %s %s", u.User.Username(), pass))
+			conn.Write(cmd)
+			temp_buf := make([]byte, 1024)
+			n, err := conn.Read(temp_buf)
+			assertIfError(err, "error reading response from redis, error: '%e'")
+			expected_response := []byte("+OK\r\n")
+			if n != len(expected_response) {
+				return nil, errors.New(fmt.Sprintf("error authenticating response from redis, error: '%s'", temp_buf))
+			}
 
-	assertIfError(err, "can't connect to redis, error: '%e'")
-	redis := Redis{conn, bufio.NewReader(conn), bufio.NewWriter(conn)}
-	pass, has_pass := u.User.Password()
-	if has_pass {
-		authenticate(redis, u.User.Username(), pass)
-	}
+		}
+		if u.Path != "" {
+			split_path := strings.Split(u.Path, "/")
+			assert(len(split_path) == 2, "you can only have a db selection, got paths: '%s'", u.Path)
+			cmd := encode_command(fmt.Sprintf("auth %s %s", u.User.Username(), pass))
+			conn.Write(cmd)
+			temp_buf := make([]byte, 1024)
+			_, _ = conn.Read(temp_buf)
+		}
 
-	if u.Path != "" {
-		split_path := strings.Split(u.Path, "/")
-		assert(len(split_path) == 2, "you can only have a db selection, got paths: '%s'", u.Path)
-		redis.RunCommand( "select "+split_path[1])
+		temp := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
+		return temp, nil
 	}
-	return redis
+	pool, err := NewConnectionPool(1, 10, initializer_func)
+	assertIfError(err, "error initializing client '%e'")
+
+	redis := Redis{pool}
+
+	return &redis
 }
 
 func main() {
-	// create_listen_server()
 	// command_string := "ping hello"
 	redis := RedisFromURI("redis://:asdf1234@localhost:6379/10")
 	fmt.Printf("connected to redis, pinging it.\n")
-	resp := decode_response(redis.RunCommand(, "ping hello"))
+	resp, _ := redis.RunCommandNew("ping hello")
 	fmt.Println(resp)
-	res := redis.RunCommand( "info")
-	decoded := decode_response(res)
-	fmt.Printf("%s", decoded)
-	// conn, err := net.Dial("tcp", "localhost:6379")
-	// panic_error(err)
-	// fmt.Printf("%s\n", encode_command(command_string))
-
-	// conn.Write(encode_command(command_string))
-	// read_buf := make([]byte, 256)
-	// n, err := conn.Read(read_buf)
-	// panic_error(err)
-	// fmt.Printf("read %d bytes, data: %s\n", n, read_buf)
-
-}
-
-func send_hello() {
-	conn, err := net.Dial("tcp", "localhost:9000")
-	panic_error(err)
-	for {
-		fmt.Println("[Client] sending hello\n")
-		conn.Write([]byte("hello"))
-		time.Sleep(2 * time.Second)
-	}
-}
-
-func handleConnection(conn net.Conn) {
-	remote_addr := conn.RemoteAddr()
-	fmt.Printf("[%v] Client got connected\n", remote_addr)
-	defer conn.Close()
-
-	var buf []byte = make([]byte, 1024)
-	for {
-		len, err := conn.Read(buf)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		fmt.Printf("[%v] read %d bytes | data: '%s'\n", remote_addr, len, buf)
-	}
+	res, _ := redis.RunCommandNew("set hello world")
+	fmt.Printf("%s\n", res)
+	res, _ = redis.RunCommandNew("llen esd")
+	fmt.Printf("%s\n", res)
 }
